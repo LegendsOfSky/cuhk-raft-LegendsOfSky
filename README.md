@@ -1,4 +1,4 @@
-# CUHK - Fall 2022 Raft Assignment
+# CUHK - Spring 2026 Raft Assignment
 
 ## Consensus protocol, gRPC
 
