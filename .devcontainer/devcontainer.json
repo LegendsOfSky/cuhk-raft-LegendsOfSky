@@ -1,0 +1,19 @@
+{
+    "name": "Raft dev container",
+    "image": "golang:1.23",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/src,type=bind"
+    ],
+    "customizations" : {
+        "jetbrains" : {
+            "backend" : "GoLand",
+            "settings" : {
+            },
+            "plugins": [
+            ]
+        }
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/git" : {},
+    },
+}
