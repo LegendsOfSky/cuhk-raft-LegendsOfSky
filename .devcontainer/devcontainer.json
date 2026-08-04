@@ -11,9 +11,16 @@
             },
             "plugins": [
             ]
+        },
+        "vscode": {
+            "extensions": [
+                "microsoft.docker",
+                "golang.go"
+            ]
         }
     },
     "features": {
         "ghcr.io/devcontainers/features/git" : {},
+        "ghcr.io/devcontainers/features/docker-in-docker": {}
     },
 }
