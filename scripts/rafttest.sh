@@ -1,42 +1,87 @@
 #!/usr/bin/env bash
 
-BASE_PATH=$(cd `dirname $0`/.. && pwd)
+BASE_PATH=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT_PATH=$BASE_PATH/scripts
 BIN_PATH=$BASE_PATH/bin
+LOG_DIR=$BASE_PATH/logs
 
-# compile yourCode
-cd $BASE_PATH/yourCode
-sh $BASE_PATH/yourCode/compile.sh
+# Create logs directory
+mkdir -p "$LOG_DIR"
 
-# Build the proxy runner
-# Exit immediately if there was a compile-time error.
-cd  $BASE_PATH/tests
+# ---------- coloring helper ----------
+colorize() {
+    awk '
+    {
+        if ($0 ~ /FAIL/) {
+            printf "\033[1;31m%s\033[0m\n", $0
+        } else if ($0 ~ /PASS/) {
+            printf "\033[1;32m%s\033[0m\n", $0
+        } else if (tolower($0) ~ /running/) {
+            printf "\033[1;33m%s\033[0m\n", $0
+        } else if ($0 ~ /Test/) {
+            printf "\033[1;33m%s\033[0m\n", $0
+        } else if (tolower($0) ~ /dropped/) {
+            printf "\033[1;34m%s\033[0m\n", $0
+        } else if ($0 ~ /WON/) {
+            printf "\033[1;35m%s\033[0m\n", $0
+        } else {
+            print $0
+        }
+        fflush()
+    }'
+}
+
+run_test() {
+    local name=$1
+    local num=$2
+    local logfile="$LOG_DIR/test_${num}_${name}.log"
+
+    printf "\033[1;33mTest %s starts (%s):\033[0m\n" "$num" "$logfile"
+
+    # Capture raw output to file, show colored version on console
+    "$SCRIPT_PATH/rafttest_single.sh" "$name" ${ALL_PORTS} ${ALL_PROXY_PORTS} ${TESTER_PORT} \
+        2>&1 | tee "$logfile" | colorize
+
+    echo ""
+    echo ""
+    sleep 3
+}
+
+printf "\033[1;33mPreparing tests:\033[0m\n"
+
+# ---------- compile & build ----------
+echo "Compiling yourCode"
+cd "$BASE_PATH/yourCode" || exit
+sh "$BASE_PATH/yourCode/compile.sh"
+
+echo "Build proxy runner"
+cd "$BASE_PATH/tests" || exit
 go mod tidy
-go build -o $BIN_PATH/raftproxyrunner $BASE_PATH/tests/raftproxyrunner
-if [ $? -ne 0 ]; then
-   echo "FAIL: code does not compile"
-   exit $?
+go build -buildvcs=false -o "$BIN_PATH/raftproxyrunner" "$BASE_PATH/tests/raftproxyrunner"
+errorMsg=$?
+if [ $errorMsg -ne 0 ]; then
+    echo "FAIL: code does not compile"
+    exit $errorMsg
 fi
 
-# Build the test binary to use to test the student's raft node implementation.
-# Exit immediately if there was a compile-time error.
-go build -o $BIN_PATH/rafttest $BASE_PATH/tests/rafttest
-if [ $? -ne 0 ]; then
-   echo "FAIL: code does not compile"
-   exit $?
+echo "Build test binary"
+go build -buildvcs=false -o "$BIN_PATH/rafttest" "$BASE_PATH/tests/rafttest"
+errorMsg=$?
+if [ $errorMsg -ne 0 ]; then
+    echo "FAIL: code does not compile"
+    exit $errorMsg
 fi
 
-cd $BASE_PATH
+cd "$BASE_PATH" || exit
+rm -f "$BASE_PATH/rafttest.log"
 
-rm $BASE_PATH/rafttest.log  2> /dev/null
-
-# generate 11 distinct random numbers
-while ((i<11))
-do
-   N=$(((RANDOM % 10000) + 10000))
-   echo "${A[*]}" | grep $N && continue # if number already in the array
-   A[$i]=$N
-   ((i++))
+# ---------- generate ports ----------
+i=0
+while ((i < 11)); do
+    N=$(((RANDOM % 10000) + 10000))
+    echo "${A[*]}" | grep -q "$N" && continue
+    A[$i]=$N
+    ((i++))
 done
 
 NODE_PORT0=${A[0]}
@@ -50,23 +95,40 @@ PROXY_NODE_PORT2=${A[7]}
 PROXY_NODE_PORT3=${A[8]}
 PROXY_NODE_PORT4=${A[9]}
 TESTER_PORT=${A[10]}
+
 ALL_PORTS=" ${NODE_PORT0} ${NODE_PORT1} ${NODE_PORT2} ${NODE_PORT3} ${NODE_PORT4}"
 ALL_PROXY_PORTS=" ${PROXY_NODE_PORT0} ${PROXY_NODE_PORT1} ${PROXY_NODE_PORT2} ${PROXY_NODE_PORT3} ${PROXY_NODE_PORT4}"
 
-echo "All real ports:" ${ALL_PORTS}
-echo "All proxy ports:" ${ALL_PROXY_PORTS}
+echo "All real ports:  ${ALL_PORTS}"
+echo "All proxy ports: ${ALL_PROXY_PORTS}"
+echo ""
+echo ""
+sleep 2
 
-$SCRIPT_PATH/rafttest_single.sh testOneCandidateOneRoundElection ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testOneCandidateStartTwoElection ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testTwoCandidateForElection ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testSplitVote ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testAllForElection ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testLeaderRevertToFollower ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
+echo "The following 6 tests should be passed before working on the remaining 4."
+echo "In between each test, a 3 second wait will be present."
+echo ""
+echo ""
+sleep 2
 
-$SCRIPT_PATH/rafttest_single.sh testOneSimplePut ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testOneSimpleUpdate ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testOneSimpleDelete ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
-$SCRIPT_PATH/rafttest_single.sh testDeleteNonExistKey ${ALL_PORTS}  ${ALL_PROXY_PORTS} ${TESTER_PORT}
+# ---------- run tests ----------
+run_test testOneCandidateOneRoundElection 1
+run_test testOneCandidateStartTwoElection 2
+run_test testTwoCandidateForElection     3
+run_test testSplitVote                   4
+run_test testAllForElection              5
+run_test testLeaderRevertToFollower      6
 
-cat $BASE_PATH/rafttest.log
-rm $BASE_PATH/rafttest.log
+echo "Ignore the following tests if you have failed any of the 6 tests above."
+echo ""
+echo ""
+sleep 2
+
+run_test testOneSimplePut        7
+run_test testOneSimpleUpdate     8
+run_test testOneSimpleDelete     9
+run_test testDeleteNonExistKey  10
+
+# ---------- final log ----------
+cat "$BASE_PATH/rafttest.log" | tee "$LOG_DIR/test_result.log" | colorize
+rm -f "$BASE_PATH/rafttest.log"

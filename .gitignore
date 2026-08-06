@@ -32,3 +32,5 @@ pkg
 .svn
 
 go.sum
+/scripts/rafttest.log
+/logs
