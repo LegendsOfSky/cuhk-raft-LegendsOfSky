@@ -58,7 +58,8 @@ type raftNode struct {
 	electionIntervalChangedSignalChannel  chan bool
 	heartBeatIntervalChangedSignalChannel chan bool
 	heartBeatReceivedSignalChannel        chan bool
-	revertToFollowerSignalChannel         chan bool
+	revertToFollowerOnCloseSignalChannel  chan bool
+	appendEntriesSendOnCloseSignalChannel chan bool
 
 	// persistent state on all servers (Should be updated before repsonding to RPCs)
 	currentTerm int
@@ -121,7 +122,8 @@ func NewRaftNode(
 		electionIntervalChangedSignalChannel:  make(chan bool),
 		heartBeatIntervalChangedSignalChannel: make(chan bool),
 		heartBeatReceivedSignalChannel:        make(chan bool),
-		revertToFollowerSignalChannel:         make(chan bool),
+		revertToFollowerOnCloseSignalChannel:  make(chan bool),
+		appendEntriesSendOnCloseSignalChannel: make(chan bool),
 
 		// persistent state on all servers
 		currentTerm: 0,
@@ -215,8 +217,74 @@ func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.
 	loggingPrefix := fmt.Sprintf("<%s Node %d Term %d %-20s      >", routePrefix, rn.nodeId, rn.currentTerm, "Propose")
 	log.Printf("%s: BEGIN", loggingPrefix)
 
-	// TODO: Implement this!
-	var ret raft.ProposeReply
+	ret := raft.ProposeReply{
+		CurrentLeader: int32(rn.leaderId),
+		Status:        raft.Status_WrongNode,
+	}
+
+	if rn.leaderId == rn.nodeId {
+		if args.Op == raft.Operation_Put {
+			log.Printf("%s: Propose putting new entry (Key: %s, Value: %d)", loggingPrefix, args.Key, args.V)
+		} else if args.Op == raft.Operation_Delete {
+			log.Printf("%s: Propose deleting entry (Key: %s)", loggingPrefix, args.Key)
+		}
+
+		rn.log[rn.logCount] = &raft.LogEntry{
+			Term:  int32(rn.currentTerm),
+			Op:    args.Op,
+			Key:   args.Key,
+			Value: args.V,
+		}
+		thisLogIndex := rn.logCount
+		rn.logCount++
+
+		for { // wait for exit:
+			select {
+			// return when this operation has been committed
+			case <-rn.appendEntriesSendOnCloseSignalChannel:
+				if rn.commitIndex >= thisLogIndex {
+					hasValue := false
+					deleteIndex := -1
+					for i := rn.commitIndex; i >= 0; i-- {
+						if rn.log[i].Key == args.Key {
+							if rn.log[i].Op == raft.Operation_Delete {
+								deleteIndex = i
+							} else {
+								hasValue = true
+							}
+							break
+						}
+					}
+
+					if hasValue {
+						log.Printf("%s: Propose %s success (put).", loggingPrefix, args.Key)
+						ret.Status = raft.Status_OK
+						return &ret, nil
+					}
+
+					for i := deleteIndex - 1; i >= 0; i-- {
+						if rn.log[i].Key == args.Key && rn.log[i].Op == raft.Operation_Put {
+							log.Printf("%s: Propose %s success (delete).", loggingPrefix, args.Key)
+							ret.Status = raft.Status_OK
+							return &ret, nil
+						}
+					}
+
+					log.Printf("%s: Propose %s fail because there is no such key to delete", loggingPrefix, args.Key)
+					ret.Status = raft.Status_KeyNotFound
+					return &ret, nil
+				}
+
+			// return when this node is not leader
+			case <-rn.revertToFollowerOnCloseSignalChannel:
+				log.Printf("%s: Propose %s failed.", loggingPrefix, args.Key)
+				ret.Status = raft.Status_WrongNode
+				return &ret, nil
+			}
+		}
+	}
+
+	log.Printf("%s: Cannot handle new propose because this node is not raft leader.", loggingPrefix)
 	return &ret, nil
 }
 
@@ -228,8 +296,24 @@ func (rn *raftNode) GetValue(ctx context.Context, args *raft.GetValueArgs) (*raf
 	loggingPrefix := fmt.Sprintf("<%s Node %d Term %d %-20s      >", routePrefix, rn.nodeId, rn.currentTerm, "GetValue")
 	log.Printf("%s: BEGIN", loggingPrefix)
 
-	// TODO: Implement this!
-	var ret raft.GetValueReply
+	ret := raft.GetValueReply{
+		Status: raft.Status_KeyNotFound,
+	}
+	for i := rn.commitIndex; i >= 0; i-- {
+		entry := rn.log[i]
+		if entry.Key == args.Key {
+			if entry.Op == raft.Operation_Put {
+				log.Printf("%s: Value founded (key = %s).", loggingPrefix, args.Key)
+				ret.Status = raft.Status_KeyFound
+				ret.V = entry.Value
+				return &ret, nil
+			} else if entry.Op == raft.Operation_Delete {
+				log.Printf("%s: This value (key = %s) has been deleted.", loggingPrefix, args.Key)
+				ret.Status = raft.Status_KeyNotFound
+				return &ret, nil
+			}
+		}
+	}
 	return &ret, nil
 }
 
@@ -272,10 +356,10 @@ func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs)
 			rn.heartBeatReceivedSignalChannel <- true
 		} else if rn.nodeRole == raft.Role_Candidate {
 			log.Printf("%s: Higher term found, revert to follower", loggingPrefix)
-			rn.revertToFollowerSignalChannel <- true
+			rn.revertToFollower()
 		} else if rn.nodeRole == raft.Role_Leader {
 			log.Printf("%s: Higher term found, revert to follower", loggingPrefix)
-			rn.revertToFollowerSignalChannel <- true
+			rn.revertToFollower()
 			rn.leaderId = -1
 		} else {
 			log.Printf("%s: Invalid state (Code navigation key: RW98WuDp0eXFZZGR)", loggingPrefix)
@@ -340,7 +424,7 @@ func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesA
 		rn.heartBeatReceivedSignalChannel <- true
 	} else if rn.nodeRole == raft.Role_Candidate {
 		log.Printf("%s: Revert to follower (Candidate -> Follower).", loggingPrefix)
-		rn.revertToFollowerSignalChannel <- true
+		rn.revertToFollower()
 	} else if rn.nodeRole == raft.Role_Leader {
 		log.Printf("%s: TODO finish this state (Code navigation key: lm2leockDs3uGiHJ).", loggingPrefix)
 	} else {
@@ -377,9 +461,11 @@ func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesA
 			rn.commitIndex = int(args.LeaderCommit)
 		}
 	}
+	log.Printf("%s: Commit index has been set to %d.", loggingPrefix, rn.commitIndex)
 
-	log.Printf("%s: Append entries success.", loggingPrefix)
 	reply.Success = true
+	reply.MatchIndex = args.PrevLogIndex + int32(len(args.Entries))
+	log.Printf("%s: Append entries success (matchIndex = %d).", loggingPrefix, reply.MatchIndex)
 	return &reply, nil
 }
 
@@ -474,7 +560,7 @@ func (rn *raftNode) runAsCandidate() {
 	ListeningLoop:
 		for {
 			select {
-			case <-rn.revertToFollowerSignalChannel:
+			case <-rn.revertToFollowerOnCloseSignalChannel:
 				log.Printf("%s: Revert to follower.", loggingPrefix)
 				rn.nodeRole = raft.Role_Follower
 				return
@@ -543,7 +629,7 @@ func (rn *raftNode) runAsLeader() {
 	heartBeatTimerTimeoutTriggerChannel := time.After(time.Duration(rn.heartBeatTimeoutInterval) * time.Millisecond)
 	for {
 		select {
-		case <-rn.revertToFollowerSignalChannel:
+		case <-rn.revertToFollowerOnCloseSignalChannel:
 			log.Printf("%s: Revert to follower.", loggingPrefix)
 			rn.nodeRole = raft.Role_Follower
 			rn.leaderId = -1
@@ -553,7 +639,44 @@ func (rn *raftNode) runAsLeader() {
 			log.Printf("%s: Heart beat timer triggered.", loggingPrefix)
 			return
 
-			// TODO handle command sent client
+		case reply := <-appendEntriesReplyChannel:
+			log.Printf("%s: New reply received from node %d.", loggingPrefix, reply.From)
+
+			replyNodeId := int(reply.From)
+			replyMatchIndex := int(reply.MatchIndex)
+			if reply.Success {
+				rn.nextIndex[replyNodeId] = replyMatchIndex + 1
+				rn.matchIndex[replyNodeId] = replyMatchIndex
+			} else {
+				rn.nextIndex[replyNodeId]--
+				if rn.nextIndex[replyNodeId] < 1 {
+					rn.nextIndex[replyNodeId] = 1
+				}
+			}
+
+			prevailedCounts := make([]int, len(rn.hostConnectionMap)+1)
+			for queryNodeId := range rn.hostConnectionMap {
+				for comparedNodeId := range rn.hostConnectionMap {
+					if rn.matchIndex[queryNodeId] <= rn.matchIndex[comparedNodeId] {
+						prevailedCounts[queryNodeId]++
+					}
+				}
+			}
+			minRequiredCount := len(rn.hostConnectionMap) / 2
+			for nodeId := range rn.hostConnectionMap {
+				matchIndex := rn.matchIndex[nodeId]
+				if int(rn.log[matchIndex].Term) != rn.currentTerm {
+					continue
+				}
+
+				if matchIndex >= rn.commitIndex && prevailedCounts[nodeId] >= minRequiredCount {
+					rn.commitIndex = matchIndex
+				}
+			}
+			log.Printf("%s: Commit index has been set to %d.", loggingPrefix, rn.commitIndex)
+
+			close(rn.appendEntriesSendOnCloseSignalChannel)
+			rn.appendEntriesSendOnCloseSignalChannel = make(chan bool)
 		}
 	}
 }
@@ -616,8 +739,8 @@ func (rn *raftNode) appendEntriesToOtherNode(
 	log.Printf("%s: BEGIN", loggingPrefix)
 	log.Printf("%s: Sending AppendEntries() RPC to node %d.", loggingPrefix, clientNodeId)
 
-	entriesCount := 0
-	prevLogIndex := rn.logCount - 1
+	entriesCount := rn.logCount - rn.nextIndex[clientNodeId]
+	prevLogIndex := rn.nextIndex[clientNodeId] - 1
 	args := raft.AppendEntriesArgs{
 		From: int32(rn.nodeId),
 		To:   int32(clientNodeId),
@@ -627,14 +750,14 @@ func (rn *raftNode) appendEntriesToOtherNode(
 		PrevLogIndex: int32(prevLogIndex),
 		PrevLogTerm:  rn.log[prevLogIndex].Term,
 
-		// TODO add entries
 		Entries:      make([]*raft.LogEntry, entriesCount),
 		LeaderCommit: int32(rn.commitIndex),
 	}
 
-	log.Printf("%s: TODO include entries", loggingPrefix)
+	log.Printf("%s: Total of %d entries should be appended.", loggingPrefix, entriesCount)
+
 	for i := 0; i < entriesCount; i++ {
-		args.Entries[i] = &raft.LogEntry{}
+		args.Entries[i] = rn.log[rn.nextIndex[clientNodeId]+i]
 	}
 
 	reply, err := client.AppendEntries(context.Background(), &args)
@@ -646,6 +769,11 @@ func (rn *raftNode) appendEntriesToOtherNode(
 		return
 	}
 	appendEntriesReplyChannel <- reply
+}
+
+func (rn raftNode) revertToFollower() {
+	close(rn.revertToFollowerOnCloseSignalChannel)
+	rn.revertToFollowerOnCloseSignalChannel = make(chan bool)
 }
 
 func computeRoutePrefix(sourceNodeId int, targetNodeId int, loggingNodeId int, nodeCount int) string {
